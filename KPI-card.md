@@ -20,10 +20,6 @@ Count distinct OpenStreetMap features tagged `leisure=park`, `leisure=garden`, `
 
 The attached CSV gives bounding rectangles, not actual suburb polygons. A rectangle may include mapped features beyond the suburb's true boundary. The supplied `area_km2` is the suburb area, not the rectangle area, so this count-over-area measure is indicative and can be biased for irregular or coastal suburbs. Exact suburb filtering requires polygon boundaries. The UI calls this a CSV bounding-box estimate.
 
-## Optional walking-network comparison
-
-When `OPENROUTESERVICE_API_KEY` is configured, the app shows a separate score using a 1 km foot-walking-distance isochrone from each suburb's representative point. It counts the same four OSM tags in the isochrone and divides by the isochrone's approximate polygon area. This can better reflect route reach than a geometric box, but OSM path coverage varies and feature points do not confirm entrances. It is not a 15-minute accessibility score. Most centres come from matched ABS representative points; unmatched records use their CSV box midpoint.
-
 ## Wireframe placement
 
 Place the KPI below the two-suburb selectors. Show each raw count, source area, density and pair-relative score together. Label the main result **CSV bounding-box estimate** and explain that counts may include features outside the true suburb boundary.

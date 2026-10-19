@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import os
 import time
 import csv
@@ -46,7 +45,6 @@ def load_local_env() -> None:
 load_local_env()
 st.set_page_config(page_title="Demografy | Neighbourhood comparison", page_icon="⌂", layout="wide")
 
-WALKABLE_DISTANCE_KM = 1.0
 CATEGORY = "Parks"
 OSM_SOURCE = "osm_overpass_bbox_green_recreation"
 OSM_LEISURE_TAGS = ("park", "garden", "nature_reserve", "playground")
@@ -58,7 +56,6 @@ OVERPASS_ENDPOINTS = (
     "https://overpass.private.coffee/api/interpreter",
     "https://maps.mail.ru/osm/tools/overpass/api/interpreter",
 )
-ORS_ISOCHRONE_URL = "https://api.openrouteservice.org/v2/isochrones/foot-walking"
 
 
 def setting(name: str) -> str:
@@ -127,7 +124,7 @@ def search_suburbs(query: str) -> tuple[list[dict], str | None]:
             "GET",
             "suburbs",
             params={
-                "select": "suburb,sal_code,sal_name,state_abbr,centre_lat,centre_lon,legacy_name,area_km2,min_lat,min_lon,max_lat,max_lon",
+                "select": "suburb,sal_code,sal_name,state_abbr,legacy_name,area_km2,min_lat,min_lon,max_lat,max_lon",
                 "is_active": "eq.true",
                 "suburb": f"ilike.*{cleaned}*",
                 "order": "suburb.asc",
@@ -168,106 +165,6 @@ def load_saved_counts(
         return counts, None
     except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
         return counts, str(exc)
-
-
-def point_in_polygon(lon: float, lat: float, coordinates: list) -> bool:
-    """Return whether a lon/lat point lies inside a GeoJSON Polygon or MultiPolygon."""
-    polygons = [coordinates] if coordinates and isinstance(coordinates[0][0][0], (int, float)) else coordinates
-    for polygon in polygons:
-        ring = polygon[0]
-        inside = False
-        previous = len(ring) - 1
-        for current, (x1, y1) in enumerate(ring):
-            x2, y2 = ring[previous]
-            if (y1 > lat) != (y2 > lat) and lon < (x2 - x1) * (lat - y1) / (y2 - y1) + x1:
-                inside = not inside
-            previous = current
-        if inside:
-            return True
-    return False
-
-
-def geojson_area_km2(geometry: dict, reference_lat: float) -> float:
-    """Approximate polygon area in km² using a local equirectangular projection."""
-    coordinates = geometry["coordinates"]
-    polygons = [coordinates] if geometry["type"] == "Polygon" else coordinates
-    earth_radius_km = 6371.0088
-    total_area = 0.0
-    for polygon in polygons:
-        ring = polygon[0]
-        points = [
-            (
-                math.radians(lon) * earth_radius_km * math.cos(math.radians(reference_lat)),
-                math.radians(lat) * earth_radius_km,
-            )
-            for lon, lat in ring
-        ]
-        total_area += abs(sum(
-            points[index][0] * points[(index + 1) % len(points)][1]
-            - points[(index + 1) % len(points)][0] * points[index][1]
-            for index in range(len(points))
-        )) / 2
-    return total_area
-
-
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def load_walkable_network_counts(
-    centres: tuple[tuple[str, float, float], ...], api_key: str
-) -> tuple[dict[str, int] | None, dict[str, float] | None, str, str | None]:
-    """Count selected OSM green/recreation features inside ORS walking isochrones."""
-    fetched_at = datetime.now(timezone.utc).isoformat()
-    headers = {
-        "User-Agent": "DemografyNeighbourhoodLivability/0.1 (Streamlit prototype)",
-        "Accept": "application/json",
-    }
-    counts: dict[str, int] = {}
-    areas: dict[str, float] = {}
-    errors = []
-    for endpoint in OVERPASS_ENDPOINTS:
-        try:
-            for suburb, lat, lon in centres:
-                query = (
-                    f'[out:json][timeout:25];\n'
-                    f'nwr(around:{int(WALKABLE_DISTANCE_KM * 1000)},{lat},{lon})["leisure"~"^(park|garden|nature_reserve|playground)$"];\n'
-                    "out center;"
-                )
-                osm_response = session.post(
-                    endpoint,
-                    data={"data": query},
-                    headers=headers,
-                    timeout=35,
-                )
-                osm_response.raise_for_status()
-                parks = {}
-                for element in osm_response.json().get("elements", []):
-                    point = element.get("center", element)
-                    if point.get("lat") is not None and point.get("lon") is not None:
-                        parks[(element.get("type"), element.get("id"))] = (point["lon"], point["lat"])
-
-                ors_response = session.post(
-                    ORS_ISOCHRONE_URL,
-                    headers={"Authorization": api_key, "Content-Type": "application/json"},
-                    json={"locations": [[lon, lat]], "range": [int(WALKABLE_DISTANCE_KM * 1000)], "range_type": "distance"},
-                    timeout=35,
-                )
-                ors_response.raise_for_status()
-                features = ors_response.json().get("features", [])
-                if not features:
-                    raise ValueError(f"OpenRouteService returned no walking catchment for {suburb}.")
-                geometry = features[0].get("geometry", {})
-                if geometry.get("type") not in {"Polygon", "MultiPolygon"}:
-                    raise ValueError(f"Unexpected walking catchment geometry for {suburb}.")
-                areas[suburb] = geojson_area_km2(geometry, lat)
-                if areas[suburb] <= 0:
-                    raise ValueError(f"Walking catchment area was zero for {suburb}.")
-                counts[suburb] = sum(
-                    point_in_polygon(park_lon, park_lat, geometry["coordinates"])
-                    for park_lon, park_lat in parks.values()
-                )
-            return counts, areas, fetched_at, None
-        except (requests.RequestException, ValueError, KeyError, TypeError, IndexError) as exc:
-            errors.append(f"{endpoint}: {exc}")
-    return None, None, fetched_at, "Could not calculate the OSM walking catchment. " + " | ".join(errors)
 
 
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
@@ -400,10 +297,6 @@ if not pair:
     st.stop()
 
 suburb_a, suburb_b = pair
-centres = (
-    (suburb_a["suburb"], float(suburb_a["centre_lat"]), float(suburb_a["centre_lon"])),
-    (suburb_b["suburb"], float(suburb_b["centre_lat"]), float(suburb_b["centre_lon"])),
-)
 try:
     bounds = tuple(
         (
@@ -532,41 +425,6 @@ score_labels = alt.Chart(scorecard_data).mark_text(align="left", baseline="middl
 st.altair_chart((score_bars + score_labels).properties(height=135), use_container_width=True)
 st.caption(f"CSV boundary-area score: {count_label.lower()} per km², benchmarked to the higher-density suburb in this pair.")
 
-st.subheader("Walkable network catchment score")
-ors_api_key = setting("OPENROUTESERVICE_API_KEY")
-if not ors_api_key:
-    st.info("Add OPENROUTESERVICE_API_KEY to .env or Streamlit Secrets to calculate the second chart. It uses a 1 km walking-distance isochrone generated from OpenStreetMap street and footpath data.")
-elif osm_legacy_fallback:
-    st.info("The saved counts are legacy circular park-only data. Refresh live OSM data before comparing with the walking-network feature count.")
-else:
-    with st.spinner("Calculating 1 km walkable catchments and counting mapped parks…"):
-        walk_counts, walk_areas, walk_fetched_at, walk_error = load_walkable_network_counts(centres, ors_api_key)
-    if walk_counts is None or walk_areas is None:
-        st.warning(f"Could not load walkable network scores: {walk_error}")
-    else:
-        walk_density_a = walk_counts[suburb_a["suburb"]] / walk_areas[suburb_a["suburb"]]
-        walk_density_b = walk_counts[suburb_b["suburb"]] / walk_areas[suburb_b["suburb"]]
-        walk_benchmark = max(walk_density_a, walk_density_b)
-        walk_score_a = min(100, 100 * walk_density_a / walk_benchmark) if walk_benchmark else 0
-        walk_score_b = min(100, 100 * walk_density_b / walk_benchmark) if walk_benchmark else 0
-        walk_score_data = pd.DataFrame([
-            {"Suburb": suburb_a["suburb"], "Score": round(walk_score_a), "Mapped features": walk_counts[suburb_a["suburb"]], "Catchment area (km²)": round(walk_areas[suburb_a["suburb"]], 2), "Density (/km²)": round(walk_density_a, 1)},
-            {"Suburb": suburb_b["suburb"], "Score": round(walk_score_b), "Mapped features": walk_counts[suburb_b["suburb"]], "Catchment area (km²)": round(walk_areas[suburb_b["suburb"]], 2), "Density (/km²)": round(walk_density_b, 1)},
-        ])
-        walk_bars = alt.Chart(walk_score_data).mark_bar(height=34, cornerRadiusEnd=7).encode(
-            y=alt.Y("Suburb:N", sort=alt.SortField(field="Score", order="descending"), title=None),
-            x=alt.X("Score:Q", title="Walkable green/recreation density score", scale=alt.Scale(domain=[0, 110], nice=False), axis=alt.Axis(values=[0, 25, 50, 75, 100])),
-            color=alt.Color("Suburb:N", scale=alt.Scale(domain=score_colors, range=["#8B5CF6", "#CBD0E0"]), legend=None),
-            tooltip=["Suburb:N", "Score:Q", "Mapped features:Q", "Catchment area (km²):Q", "Density (/km²):Q"],
-        )
-        walk_labels = alt.Chart(walk_score_data).mark_text(align="left", baseline="middle", dx=8, fontWeight="bold", color="#171A2E").encode(
-            y=alt.Y("Suburb:N", sort=alt.SortField(field="Score", order="descending")),
-            x=alt.X("Score:Q", scale=alt.Scale(domain=[0, 110], nice=False)),
-            text=alt.Text("Score:Q", format=".0f"),
-        )
-        st.altair_chart((walk_bars + walk_labels).properties(height=135), use_container_width=True)
-        st.dataframe(walk_score_data, hide_index=True, use_container_width=True)
-        st.caption("Walkable network score: the same four OSM leisure tags inside a 1 km foot-walking-distance isochrone, divided by that isochrone’s area. A park and its separately mapped playground or garden may count as multiple features. Scores are relative to this suburb pair.")
 with st.expander("KPI method and limitations"):
     st.markdown(
         """- **OpenStreetMap count:** distinct features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` whose representative point falls inside the CSV `min_lat`, `min_lon`, `max_lat`, `max_lon` extent. Deduplicated by OSM element type and ID; separately mapped features within the same park may each count.
@@ -574,7 +432,7 @@ with st.expander("KPI method and limitations"):
 - **Benchmark:** higher Parks density within the selected pair.
 - **Parks density score:** `min(100, suburb Parks density ÷ pair benchmark density × 100)`.
 
-CSV bounds form rectangles, not exact SAL polygons. The box can include locations outside the suburb, while `area_km2` is the true supplied SAL area; treat density as an indicative comparison. Counts are cached for 24 hours. The optional network chart uses an OpenRouteService walking-distance polygon. Neither score is a 15-minute walking-access score."""
+CSV bounds form rectangles, not exact SAL polygons. The box can include locations outside the suburb, while `area_km2` is the true supplied SAL area; treat density as an indicative comparison. Counts are cached for 24 hours."""
     )
 
 st.divider()

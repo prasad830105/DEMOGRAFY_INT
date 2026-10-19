@@ -1,6 +1,6 @@
 # Neighbourhood Livability Index
 
-This Streamlit prototype compares mapped parks and green/recreation features for two suburbs. The selectable suburb catalogue is generated from the attached `suburbs.csv`. For the main KPI, Overpass counts distinct OSM features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` when their representative point falls inside that suburb's CSV latitude/longitude bounding box. Density is feature count divided by the CSV `area_km2`; the 0–100 score compares the two selected densities. Successful counts are cached for 24 hours and synced to Supabase. The optional OpenRouteService chart remains a separate 1 km walking-network comparison.
+This Streamlit prototype compares mapped parks and green/recreation features for two suburbs. The selectable suburb catalogue is generated from the attached `suburbs.csv`. For the main KPI, Overpass counts distinct OSM features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` when their representative point falls inside that suburb's CSV latitude/longitude bounding box. Density is feature count divided by the CSV `area_km2`; the 0–100 score compares the two selected densities. Successful counts are cached for 24 hours and synced to Supabase.
 
 Google Places is not an active source in this boundary-based version, so it does not make Google searches or encounter the stated 60-result cap. If Google is added later, any search returning 60 results must be flagged as capped; the true count may be higher.
 
@@ -37,8 +37,4 @@ The app searches Supabase first and falls back to the bundled `suburbs_import.cs
 
 Public Overpass endpoints can be unavailable or impose load limits, and very large bounding boxes may be slow or fail. The app tries several public endpoints. OSM coverage and tagging completeness vary. OSM attribution is shown in the app.
 
-## Optional walking-network chart
-
-Set `OPENROUTESERVICE_API_KEY` in `.env` or Streamlit Secrets to enable the separate chart. It asks OpenRouteService for a 1 km foot-walking-distance isochrone from each suburb's representative point and counts the same four OSM features within the resulting polygon. Matched suburb records use the representative points from the bundled ABS file; unmatched records use the CSV box midpoint. The network chart is not a 15-minute walking-access measure, and park feature points do not confirm a usable entrance.
-
-For Streamlit Community Cloud, set `SUPABASE_URL`, `SUPABASE_KEY` and optionally `OPENROUTESERVICE_API_KEY` under the app's Secrets settings. The current Supabase policies are for public illustrative/demo data; use authenticated, least-privilege policies before storing private or production data.
+For Streamlit Community Cloud, set `SUPABASE_URL` and `SUPABASE_KEY` under the app's Secrets settings. The current Supabase policies are for public illustrative/demo data; use authenticated, least-privilege policies before storing private or production data.
