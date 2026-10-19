@@ -7,3 +7,7 @@ __pycache__/
 !.env.example
 .streamlit/secrets.toml
 .pytest_cache/
+streamlit.log
+streamlit-error.log
+.streamlit/*.log
+.streamlit/*.err

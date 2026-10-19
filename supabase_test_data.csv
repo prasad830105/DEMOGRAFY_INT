@@ -1,0 +1,4 @@
+suburb,category,place_count,source
+"Parramatta, NSW",Parks,15,illustrative_test_data
+"Chatswood, NSW",Parks,22,illustrative_test_data
+"Newtown, NSW",Parks,11,illustrative_test_data

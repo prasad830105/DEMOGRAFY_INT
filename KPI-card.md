@@ -1,42 +1,38 @@
-# KPI card: Daily Needs Amenity Density Score
+# KPI card: Parks and Green/Recreation Feature Density Score
 
 ## Purpose
 
-Give buyers and buyer's agents a comparable signal of how many everyday destinations are concentrated near a suburb centre. The current prototype uses a fixed 1 km straight-line radius as a practical, repeatable catchment.
-
-> This is an amenity-density proxy, not a walking-time or 15-minute reachability measure. That future metric needs a pedestrian routing network and a defined residential starting point.
+Help buyers and buyer's agents compare mapped parks and related green/recreation features across two selected suburbs.
 
 ## Definition
 
-For each category, count distinct Google Places within 1 km of the selected suburb centre, then divide by the circular catchment area. Convert each category density into a comparison score from 0 to 100, and average the category scores with equal weights.
-
-| Category | Google Places API types (initial mapping) |
-|---|---|
-| Cafes | `cafe` |
-| Parks | `park`, `city_park`, `botanical_garden` |
-| Wellness | `gym`, `fitness_center`, `sports_complex`, `yoga_studio` |
-| Childcare | `preschool`, `child_care_agency` |
-| Transport | `bus_stop`, `train_station`, `subway_station`, `light_rail_station`, `tram_stop`, `transit_station` |
-
-Place types are configurable, may overlap, and should be checked against the current Google Places API type list before implementation. Deduplicate results by Place ID across type searches.
+Count distinct OpenStreetMap features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` whose representative point falls within the suburb's latitude/longitude bounding box in `suburbs.csv`. Divide that count by the suburb's source `area_km2` to calculate features per square kilometre. Compare those densities within the selected pair, assigning the higher density 100 and scaling the other proportionally.
 
 ## Calculation
 
-1. **Count:** `category_count = distinct matching Place IDs inside 1 km`
-2. **Catchment area:** `area_km2 = π × 1² = 3.1416 km²`
-3. **Density:** `density_per_km2 = category_count / 3.1416`
-4. **Comparison score (prototype):** for each category, `score = 100 × suburb_density / max(density for the two compared suburbs)`. If both densities are zero, both scores are zero.
-5. **Overall KPI:** `mean(category scores)` across the five categories. Show category densities beside the overall score so the result stays explainable.
+1. **Feature count:** unique OSM elements by element type and ID, filtered by the selected suburb's CSV `min_lat`, `min_lon`, `max_lat` and `max_lon` values. A mapped park and its separately mapped playground or garden can count as separate features.
+2. **Suburb area:** the source CSV's `area_km2` value.
+3. **Density:** `feature_count ÷ area_km2` features per km².
+4. **Pair benchmark:** the higher density of the two selected suburbs.
+5. **Score:** `min(100, 100 × suburb_density ÷ pair_benchmark_density)`. If both densities are zero, both scores are zero.
 
-The comparison score is pair-relative: adding a different suburb can change the score. Before using it for saved rankings or comparisons across sessions, replace the pair maximum with a fixed reference distribution (for example, a metro/state cohort percentile) and document the cohort and refresh date. Equal category weighting is also a product decision for review.
+## Important boundary limitation
+
+The attached CSV gives bounding rectangles, not actual suburb polygons. A rectangle may include mapped features beyond the suburb's true boundary. The supplied `area_km2` is the suburb area, not the rectangle area, so this count-over-area measure is indicative and can be biased for irregular or coastal suburbs. Exact suburb filtering requires polygon boundaries. The UI calls this a CSV bounding-box estimate.
+
+## Optional walking-network comparison
+
+When `OPENROUTESERVICE_API_KEY` is configured, the app shows a separate score using a 1 km foot-walking-distance isochrone from each suburb's representative point. It counts the same four OSM tags in the isochrone and divides by the isochrone's approximate polygon area. This can better reflect route reach than a geometric box, but OSM path coverage varies and feature points do not confirm entrances. It is not a 15-minute accessibility score. Most centres come from matched ABS representative points; unmatched records use their CSV box midpoint.
 
 ## Wireframe placement
 
-Place the KPI card directly below the suburb search and status message, before the category comparison. Keep the five category rows as the drill-down. Label the measure **Daily Needs Amenity Density Score** and the catchment as **within 1 km of suburb centre**. Do not label this calculation “15-minute walk” or “reachability.”
+Place the KPI below the two-suburb selectors. Show each raw count, source area, density and pair-relative score together. Label the main result **CSV bounding-box estimate** and explain that counts may include features outside the true suburb boundary.
 
 ## Data and delivery notes
 
-- The current dashboard values are illustrative fixtures, not live Google results.
-- Store API keys in environment variables or Streamlit secrets; never commit secrets or `.env` files.
-- A production implementation must confirm the suburb-centre geocoding method, API field mask, pagination/result completeness, cache duration, and Google Maps Platform storage/display terms.
-- Validate category/type mappings with stakeholders; Google documents that one place can have multiple types. [Google Places API (New) place types](https://developers.google.com/maps/documentation/places/web-service/place-types)
+- The app queries only the two selected bounding boxes. It caches results for 24 hours, checks Supabase after the app cache, and syncs successful Overpass results to `public.amenity_counts` using `source=osm_overpass_bbox_green_recreation`.
+- Run `supabase_osm_policy.sql` to permit reading and writing this source. Old `osm_overpass` records are circular, park-only legacy values; the app labels them if it must fall back to them.
+- Public Overpass endpoints may be busy or unavailable, and very large CSV rectangles can take longer or fail. OSM coverage/tagging completeness also varies.
+- Google Places is not queried in the current boundary-based KPI, so no search can reach its 60-result cap in this version. If the provider is introduced later, label a result of 60 as capped because additional places may exist.
+- Display “© OpenStreetMap contributors.”
+- The pair-relative benchmark changes when the comparison suburb changes. Use a fixed, dated benchmark for stable suburb rankings.
