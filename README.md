@@ -1,8 +1,19 @@
 # Neighbourhood Livability Index
 
-This Streamlit prototype compares mapped parks and green/recreation features for two suburbs. The selectable suburb catalogue is generated from the attached `suburbs.csv`. For the main KPI, Overpass counts distinct OSM features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` when their representative point falls inside that suburb's CSV latitude/longitude bounding box. Density is feature count divided by the CSV `area_km2`; the 0–100 score compares the two selected densities. Successful counts are cached for 24 hours and synced to Supabase.
+This Streamlit prototype compares **Parks & Outdoor Places** for two suburbs. The selectable suburb catalogue is generated from `suburbs.csv`. For this KPI, Overpass counts distinct OSM features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` when their representative point falls inside that suburb's CSV latitude/longitude bounding box. Density is feature count divided by the CSV `area_km2`; the 0–100 score compares the two selected densities. Successful counts are cached for 24 hours and synced to Supabase. The display name is buyer-facing; the database category remains `Parks` for compatibility with existing data.
 
 Google Places is not an active source in this boundary-based version, so it does not make Google searches or encounter the stated 60-result cap. If Google is added later, any search returning 60 results must be flagged as capped; the true count may be higher.
+
+## Latest real comparison
+
+The running app compared **Chatswood, NSW** with **Newtown, NSW** using saved OSM results read from Supabase:
+
+| Suburb | Parks & Outdoor Places count | SAL area (km²) | Density (features/km²) | Pair-relative score |
+| --- | ---: | ---: | ---: | ---: |
+| Chatswood, NSW | 95 | 5.01 | 19.0 | 35/100 |
+| Newtown, NSW | 86 | 1.59 | 54.2 | 100/100 |
+
+Newtown receives the 100 mark because it has the higher **density**, even though its raw feature count is lower. The score is calculated against the higher density in this selected pair, so it changes when the comparison suburb changes. Counts come from OSM and use the suburb CSV bounding-box method; they are not exact SAL-polygon counts.
 
 ## Run locally
 
@@ -37,4 +48,28 @@ The app searches Supabase first and falls back to the bundled `suburbs_import.cs
 
 Public Overpass endpoints can be unavailable or impose load limits, and very large bounding boxes may be slow or fail. The app tries several public endpoints. OSM coverage and tagging completeness vary. OSM attribution is shown in the app.
 
+## Load Parks & Outdoor Places data for 60 suburbs
+
+1. Start the app and turn on **Load KPI data for 60 suburbs**.
+2. Use the bundled **Download 60-suburb starter list**, or upload a CSV with one column named `suburb`. Use full labels from the ABS catalogue, including state, such as `Chatswood, NSW`.
+3. Select **Fetch KPI data and update Supabase**. Existing rows with source `osm_overpass_bbox_green_recreation` are reused first. Missing suburbs are queried from Overpass in batches of up to five bounding boxes, and successful counts are upserted into `public.amenity_counts`.
+4. The results table shows the suburb, state, feature count and data source. Download the collected-counts CSV to keep a snapshot.
+
+The importer accepts at most 60 unique suburbs per run to keep public Overpass usage reasonable. It requires the bundled `suburbs_import.csv` catalogue to contain the requested active suburbs and their bounds, and Supabase credentials/policies that permit reading and upserting the current OSM source. If an Overpass batch fails, successful saved results remain available and failed suburbs are listed so the import can be retried. OSM counts use representative points inside each SAL's rectangular extent, not exact SAL polygons.
+
 For Streamlit Community Cloud, set `SUPABASE_URL` and `SUPABASE_KEY` under the app's Secrets settings. The current Supabase policies are for public illustrative/demo data; use authenticated, least-privilege policies before storing private or production data.
+
+## Run the project checks
+
+The mentor's original checker targets a different Google Places/PostgreSQL starter architecture. This repo uses OSM Overpass and Supabase REST, so `check.py` keeps the original A–E progression while checking the equivalent behavior in this app. Checks that touch APIs or Supabase use local fake responses; they do not make network requests or write to the database.
+
+```powershell
+python check.py A      # KPI, density, pair score, suburb catalogue
+python check.py B      # Supabase REST filters/upsert shape and cache TTLs
+python check.py C      # OSM query tags, batching and feature de-duplication
+python check.py D      # suburb labels, saved-data reuse and five-suburb batches
+python check.py E      # CSV bounding-box inclusion and limitation disclosure
+python check.py ALL    # run every stage, stopping at the first failure
+```
+
+Stage E intentionally validates the app's current rectangular extent method, not exact SAL polygon containment. Exact-boundary checks require polygon geometry to be added to the app first.

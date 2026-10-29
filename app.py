@@ -12,6 +12,14 @@ import altair as alt
 import pandas as pd
 import requests
 import streamlit as st
+from kpi_logic import (
+    CATEGORY,
+    DISPLAY_NAME,
+    OSM_LEISURE_TAGS,
+    OSM_SOURCE,
+    density as calculate_density,
+    pair_scores,
+)
 
 # Create a session with retry logic
 from requests.adapters import HTTPAdapter
@@ -45,9 +53,6 @@ def load_local_env() -> None:
 load_local_env()
 st.set_page_config(page_title="Demografy | Neighbourhood comparison", page_icon="⌂", layout="wide")
 
-CATEGORY = "Parks"
-OSM_SOURCE = "osm_overpass_bbox_green_recreation"
-OSM_LEISURE_TAGS = ("park", "garden", "nature_reserve", "playground")
 OVERPASS_ENDPOINTS = (
     "https://overpass-api.de/api/interpreter",
     "https://overpass.kaywa.de/api/interpreter",
@@ -246,6 +251,211 @@ def save_osm_counts(counts: dict[str, int]) -> None:
     )
 
 
+@st.cache_data(ttl=15 * 60, show_spinner=False)
+def load_bulk_saved_counts() -> dict[str, int]:
+    """Load the current tagged-OSM counts for bulk suburb data loading."""
+    rows = supabase_request(
+        "GET",
+        "amenity_counts",
+        params={
+            "select": "suburb,place_count",
+            "category": f"eq.{CATEGORY}",
+            "source": f"eq.{OSM_SOURCE}",
+            "limit": "10000",
+        },
+    )
+    return {row["suburb"]: int(row["place_count"]) for row in rows}
+
+
+def fetch_osm_batch(bounds: tuple[tuple[str, float, float, float, float], ...]) -> dict[str, int]:
+    """Fetch up to five suburb bounding boxes in one Overpass request."""
+    query_parts = [
+        f'nwr({south},{west},{north},{east})["leisure"~"^(park|garden|nature_reserve|playground)$"];'
+        for _, south, west, north, east in bounds
+    ]
+    query = "[out:json][timeout:60];\n(\n" + "\n".join(query_parts) + "\n);\nout center;"
+    errors = []
+    for endpoint in OVERPASS_ENDPOINTS:
+        try:
+            response = session.post(
+                endpoint,
+                data={"data": query},
+                headers={
+                    "User-Agent": "DemografyNeighbourhoodLivability/0.1 (Streamlit prototype)",
+                    "Accept": "application/json",
+                },
+                timeout=90,
+            )
+            response.raise_for_status()
+            elements = {
+                (element.get("type"), element.get("id")): element
+                for element in response.json().get("elements", [])
+            }
+            counted = {suburb: set() for suburb, *_ in bounds}
+            for identity, element in elements.items():
+                point = element.get("center", element)
+                if "lat" not in point or "lon" not in point:
+                    continue
+                if element.get("tags", {}).get("leisure") not in OSM_LEISURE_TAGS:
+                    continue
+                for suburb, south, west, north, east in bounds:
+                    if south <= point["lat"] <= north and west <= point["lon"] <= east:
+                        counted[suburb].add(identity)
+            return {suburb: len(features) for suburb, features in counted.items()}
+        except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
+            errors.append(f"{endpoint}: {exc}")
+    raise RuntimeError("All Overpass endpoints failed. " + " | ".join(errors))
+
+
+def resolve_import_suburbs(uploaded_names: list[str]) -> tuple[list[dict], list[str]]:
+    """Resolve uploaded full suburb labels to rows with usable SAL bounds."""
+    catalogue = load_local_suburbs()
+    by_name = {row["suburb"].strip().casefold(): row for row in catalogue}
+    resolved, missing = [], []
+    seen = set()
+    for name in uploaded_names:
+        cleaned = name.strip()
+        if not cleaned or cleaned.casefold() in seen:
+            continue
+        seen.add(cleaned.casefold())
+        row = by_name.get(cleaned.casefold())
+        if row and row.get("is_active", "true").casefold() == "true":
+            try:
+                if float(row["area_km2"]) > 0 and all(row[key] for key in ("min_lat", "min_lon", "max_lat", "max_lon")):
+                    resolved.append(row)
+                    continue
+            except (KeyError, TypeError, ValueError):
+                pass
+        missing.append(cleaned)
+    return resolved, missing
+
+
+def load_suburb_kpi_data(rows: list[dict], progress) -> tuple[pd.DataFrame, list[str], int]:
+    """Reuse Supabase data, fetch missing rows in small batches, and persist results."""
+    try:
+        saved_counts = load_bulk_saved_counts()
+        saved_error = None
+    except (requests.RequestException, ValueError, KeyError, RuntimeError) as exc:
+        saved_counts, saved_error = {}, str(exc)
+
+    all_counts: dict[str, int] = {}
+    data_source: dict[str, str] = {}
+    missing_rows = []
+    for row in rows:
+        label = row["suburb"]
+        aliases = (label, row.get("legacy_name", ""))
+        saved_value = next((saved_counts[alias] for alias in aliases if alias and alias in saved_counts), None)
+        if saved_value is not None:
+            all_counts[label] = saved_value
+            data_source[label] = "Supabase"
+        else:
+            missing_rows.append(row)
+
+    errors = [f"Supabase lookup failed: {saved_error}"] if saved_error else []
+    synced = 0
+    chunks = [missing_rows[index:index + 5] for index in range(0, len(missing_rows), 5)]
+    progress.progress(0.0, text=f"Using {len(all_counts)} saved Supabase results; {len(missing_rows)} need OSM data…")
+    for index, chunk in enumerate(chunks):
+        bounds = tuple(
+            (row["suburb"], float(row["min_lat"]), float(row["min_lon"]), float(row["max_lat"]), float(row["max_lon"]))
+            for row in chunk
+        )
+        try:
+            live = fetch_osm_batch(bounds)
+            all_counts.update(live)
+            data_source.update({suburb: "OpenStreetMap" for suburb in live})
+            try:
+                save_osm_counts(live)
+                synced += len(live)
+            except (requests.RequestException, ValueError, RuntimeError) as exc:
+                errors.append(f"OSM results for {', '.join(live)} could not sync to Supabase: {exc}")
+        except (requests.RequestException, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            errors.append(f"Could not fetch {', '.join(row['suburb'] for row in chunk)}: {exc}")
+        progress.progress((index + 1) / max(1, len(chunks)), text=f"Processed batch {index + 1} of {len(chunks)}…")
+    if not chunks:
+        progress.progress(1.0, text="All requested results were already saved in Supabase.")
+
+    output = []
+    for row in rows:
+        name = row["suburb"]
+        if name not in all_counts:
+            continue
+        count = all_counts[name]
+        output.append({
+            "Suburb": name,
+            "State": row.get("state_abbr", ""),
+            "Feature count": count,
+            "Data source": data_source[name],
+        })
+    return pd.DataFrame(output), errors, synced
+
+
+def render_suburb_data_import() -> None:
+    """Import a suburb list, populate its KPI cache, and show collected counts."""
+    default_path = Path(__file__).with_name("popular_suburbs.csv")
+    st.subheader("Load Parks & Outdoor Places data for suburbs")
+    st.write("Upload a CSV with a `suburb` column containing full labels from the ABS catalogue, such as `Chatswood, NSW`. Current saved OSM results are reused; missing suburbs are fetched in batches of five and synced to Supabase.")
+    st.download_button(
+        "Download 60-suburb starter list",
+        data=default_path.read_bytes() if default_path.exists() else "suburb\n",
+        file_name="popular_suburbs.csv",
+        mime="text/csv",
+    )
+    uploaded = st.file_uploader("Upload your suburb list CSV", type=["csv"], key="kpi_suburb_csv")
+    if uploaded is None:
+        st.caption("The bundled 60-suburb starter list will be used if you start the import without uploading a file.")
+    if st.button("Fetch KPI data and update Supabase", type="primary", key="run_suburb_kpi_import"):
+        st.session_state.pop("suburb_kpi_result", None)
+        st.session_state.pop("suburb_kpi_errors", None)
+        try:
+            source = uploaded if uploaded is not None else default_path
+            if uploaded is not None:
+                uploaded.seek(0)
+            suburb_input = pd.read_csv(source, dtype=str).fillna("")
+            if "suburb" not in suburb_input.columns:
+                st.error("The CSV needs a column named `suburb` with full labels (including state).")
+                return
+            names = [value.strip() for value in suburb_input["suburb"].tolist() if value.strip()]
+            if len(set(name.casefold() for name in names)) > 60:
+                st.error("Import up to 60 unique suburbs per run.")
+                return
+            resolved, missing = resolve_import_suburbs(names)
+            if missing:
+                st.warning("These names did not match active rows with bounds in the bundled ABS catalogue: " + ", ".join(missing[:20]))
+            if not resolved:
+                st.error("No valid suburbs were found in the uploaded list.")
+                return
+            if not all(supabase_config()):
+                st.error("Supabase is not configured. Add `SUPABASE_URL` and `SUPABASE_KEY` before importing KPI data.")
+                return
+            progress = st.progress(0.0, text="Loading suburb KPI data…")
+            result, errors, synced = load_suburb_kpi_data(resolved, progress)
+            load_bulk_saved_counts.clear()
+            load_saved_counts.clear()
+            load_osm_counts.clear()
+            st.session_state["suburb_kpi_result"] = result
+            st.session_state["suburb_kpi_errors"] = errors
+            st.session_state["suburb_kpi_synced"] = synced
+        except (OSError, pd.errors.ParserError, UnicodeDecodeError, ValueError) as exc:
+            st.error(f"Could not read the suburb CSV: {exc}")
+
+    result = st.session_state.get("suburb_kpi_result")
+    if result is not None:
+        if result.empty:
+            st.warning("No KPI counts were loaded. Review the errors below and retry after checking OSM or Supabase availability.")
+        else:
+            osm_loaded = int((result["Data source"] == "OpenStreetMap").sum())
+            supabase_loaded = int((result["Data source"] == "Supabase").sum())
+            synced = st.session_state.get("suburb_kpi_synced", 0)
+            st.success(f"Loaded {len(result)} suburb results: {supabase_loaded} reused from Supabase and {osm_loaded} fetched from OSM; {synced} fresh counts synced to Supabase.")
+            st.caption("Counts include distinct `leisure=park`, `garden`, `nature_reserve` and `playground` features inside each suburb's CSV bounding box. The box is an extent approximation, not the exact SAL polygon.")
+            st.dataframe(result, hide_index=True, width="stretch", alt="Collected parks feature counts by suburb")
+            st.download_button("Download collected counts", data=result.to_csv(index=False), file_name="suburb_parks_counts.csv", mime="text/csv")
+        errors = st.session_state.get("suburb_kpi_errors", [])
+        if errors:
+            st.warning("Some data was unavailable or could not be synced. " + " | ".join(errors[:8]))
+
+
 def suburb_label(row: dict) -> str:
     name = row["suburb"]
     state = row.get("state_abbr")
@@ -255,7 +465,10 @@ def suburb_label(row: dict) -> str:
 
 
 st.title("Neighbourhood Livability Index")
-st.caption("Search Australian suburbs and compare mapped parks and nearby green/recreation features across a pair.")
+st.caption("Search Australian suburbs and compare Parks & Outdoor Places across a pair.")
+
+if st.toggle("Load KPI data for 60 suburbs", key="show_suburb_data_import"):
+    render_suburb_data_import()
 
 if not all(supabase_config()):
     st.info("Supabase is not configured. Searching the bundled suburb CSV; live OSM counts still require an internet connection.")
@@ -293,7 +506,7 @@ if compare_clicked and selected_a and selected_b:
 
 pair = st.session_state.get("active_comparison")
 if not pair:
-    st.info("Search for two suburbs and select **Compare selected suburbs** to load their Parks counts.")
+    st.info("Search for two suburbs and select **Compare selected suburbs** to load their Parks & Outdoor Places counts.")
     st.stop()
 
 suburb_a, suburb_b = pair
@@ -360,18 +573,21 @@ if any(row["suburb"] not in counts_by_suburb for row in pair):
         st.rerun()
     st.stop()
 
-count_label = "Parks and green/recreation features" if not osm_legacy_fallback else "Parks (legacy fallback)"
+count_label = DISPLAY_NAME if not osm_legacy_fallback else "Parks (legacy fallback)"
 st.subheader(f"{count_label} Density Score")
 st.write("Distinct OSM features tagged park, garden, nature reserve or playground whose representative point falls within the selected suburb’s CSV longitude/latitude bounding box. Density uses the supplied SAL area_km2.")
 st.caption("The rectangle is an extent approximation, not the actual SAL polygon. Its feature count may include places outside the suburb; area_km2 is the supplied SAL area. Scores are benchmarked against the higher density in this selected pair.")
 
 count_a = counts_by_suburb[suburb_a["suburb"]]
 count_b = counts_by_suburb[suburb_b["suburb"]]
-density_a = count_a / float(suburb_a["area_km2"])
-density_b = count_b / float(suburb_b["area_km2"])
-benchmark_density = max(density_a, density_b)
-score_a = min(100, 100 * density_a / benchmark_density) if benchmark_density else 0
-score_b = min(100, 100 * density_b / benchmark_density) if benchmark_density else 0
+density_a = calculate_density(count_a, float(suburb_a["area_km2"]))
+density_b = calculate_density(count_b, float(suburb_b["area_km2"]))
+if density_a is None or density_b is None:
+    st.error("A suburb has an invalid area value, so its density score cannot be calculated.")
+    st.stop()
+score_a, score_b = pair_scores(density_a, density_b)
+score_a = score_a or 0.0
+score_b = score_b or 0.0
 rows = [{
     "Category": count_label,
     f"{suburb_a['suburb']} count": count_a,
@@ -408,7 +624,7 @@ else:
 if leading_suburb:
     st.success(f"{leading_suburb} has a {count_label.lower()} density score {abs(overall_a - overall_b)} points higher than {trailing_suburb}.")
 else:
-    st.info("The two suburbs are tied on the current Parks density score.")
+    st.info("The two suburbs are tied on the current Parks & Outdoor Places density score.")
 
 score_colors = [leading_suburb or suburb_a["suburb"], trailing_suburb or suburb_b["suburb"]]
 score_bars = alt.Chart(scorecard_data).mark_bar(height=34, cornerRadiusEnd=7).encode(
@@ -429,8 +645,8 @@ with st.expander("KPI method and limitations"):
     st.markdown(
         """- **OpenStreetMap count:** distinct features tagged `leisure=park`, `leisure=garden`, `leisure=nature_reserve` or `leisure=playground` whose representative point falls inside the CSV `min_lat`, `min_lon`, `max_lat`, `max_lon` extent. Deduplicated by OSM element type and ID; separately mapped features within the same park may each count.
 - **Density:** count ÷ the CSV `area_km2` value for the suburb.
-- **Benchmark:** higher Parks density within the selected pair.
-- **Parks density score:** `min(100, suburb Parks density ÷ pair benchmark density × 100)`.
+- **Benchmark:** higher Parks & Outdoor Places density within the selected pair.
+- **Parks & Outdoor Places density score:** `min(100, suburb density ÷ pair benchmark density × 100)`.
 
 CSV bounds form rectangles, not exact SAL polygons. The box can include locations outside the suburb, while `area_km2` is the true supplied SAL area; treat density as an indicative comparison. Counts are cached for 24 hours."""
     )
