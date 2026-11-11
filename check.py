@@ -340,7 +340,27 @@ def stage_e() -> None:
           and "include places outside the actual suburb" in readme)
 
 
-STAGES = {"A": stage_a, "B": stage_b, "C": stage_c, "D": stage_d, "E": stage_e}
+def stage_f() -> None:
+    from livability import weighting
+
+    prompt = "I have a toddler and no car."
+    sample = '{"weights":[{"kpi":"parks","weight":9,"reason":"prefers parks"}]}'
+    valid = weighting.suggest_weights(prompt, "test-key", ask=lambda *_: sample)
+    fallback = weighting.suggest_weights(prompt, "test-key", ask=lambda *_: "invalid",
+                                         kpis=weighting.PARKS_MEASURES)
+    check("Stage F prompt contains the preferences and asks for JSON", lambda:
+          prompt in weighting.build_prompt(prompt) and "JSON" in weighting.build_prompt(prompt))
+    check("Groq output is validated and clamped to 0–5", lambda:
+          valid.source == "ai" and valid.weights["parks"] == 5 and valid.weights["transport"] == 3)
+    check("Toddler and no car set park density weight with keyword fallback", lambda:
+          fallback.source == "keywords" and fallback.weights == {"parks_total": 3, "parks": 5})
+    check("Personal score is the weighted average of available measures", lambda:
+          weighting.personal_score({"parks_total": 100, "parks": 40}, {"parks_total": 1, "parks": 3}) == 55
+          and weighting.personal_score({"parks": None}, {"parks": 5}) is None
+          and weighting.personal_score({"parks": 50}, {"parks": 0}) is None)
+
+
+STAGES = {"A": stage_a, "B": stage_b, "C": stage_c, "D": stage_d, "E": stage_e, "F": stage_f}
 
 
 def main() -> int:
@@ -350,7 +370,7 @@ def main() -> int:
     elif stage in STAGES:
         selected = [(stage, STAGES[stage])]
     else:
-        print("Usage: python check.py A   (or B, C, D, E or ALL)")
+        print("Usage: python check.py A   (or B, C, D, E, F or ALL)")
         return 2
     global failures, checks_run
     failures = checks_run = 0

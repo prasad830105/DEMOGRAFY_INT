@@ -2,8 +2,17 @@
 gatherUsageStats = false
 
 [theme]
-primaryColor = "#8B5CF6"
+base = "light"
+primaryColor = "#7045CB"
 backgroundColor = "#FFFFFF"
-secondaryBackgroundColor = "#F2F4FB"
-textColor = "#171A2E"
-font = "sans serif"
+secondaryBackgroundColor = "#F6F1FC"
+textColor = "#1E1C29"
+linkColor = "#7045CB"
+borderColor = "#E5DDF0"
+baseRadius = "medium"
+buttonRadius = "0.375rem"
+showWidgetBorder = true
+font = "DM Sans:https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;550;600;700&display=swap"
+headingFont = "DM Sans"
+headingFontWeights = [550, 500, 500, 500, 500, 500]
+chartCategoricalColors = ["#7045CB", "#3E2C64"]
