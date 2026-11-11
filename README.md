@@ -1,34 +1,20 @@
 # Neighbourhood Livability Index
 
-The current Google Places dashboard compares **parks and outdoor places** for two Australian suburbs. Stage F converts typed preferences into editable 0–5 weights for total places and places per km². Keywords such as “toddler” and “no car” increase the concentration weight. A configured Groq key suggests weights and short reasons. Python computes the weighted personal score. The dashboard uses measured parks data for both measures.
+The Neighbourhood Livability Index is a Streamlit dashboard for comparing two Australian suburbs. Its **Weekend Escape Score** measures the concentration of parks and outdoor spaces and lets users personalise the comparison based on what matters to them.
 
-## Run the Google Places dashboard
+## Key highlights
 
-From the repository root:
+- **Suburb boundary comparison.** The current build uses Australian Bureau of Statistics (ABS) suburb polygons and Google Places Aggregate to count matching parks, national parks, playgrounds and gardens. Google can include a park whose polygon intersects the suburb boundary. [ABS suburb boundaries](https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs-edition-3/jul2021-jun2026/non-abs-structures/suburbs-and-localities) · [Google Places Aggregate](https://developers.google.com/maps/documentation/places-aggregate/request-parameters)
+- **30-day cache.** Supabase serves fresh results. The app calls Google on a cache miss or after expiry, and a scheduled job deletes expired counts.
+- **100-point benchmark.** The app divides matching outdoor places by the suburb area in km². The highest fresh positive density outside central business districts sets 100. Other density scores are scaled against that reference, capped at 100 and rounded down to the nearest five points. The benchmark updates as measurements arrive or expire.
+- **Personalised scores.** Users weight the total-places score and the density score. Groq can suggest weights from typed preferences. The app highlights the higher score, explains what drove it and uses Excellent, Good, Fair and Poor ratings.
 
-```powershell
-python -m pip install -r requirements.txt
-python check.py F
-python -m streamlit run app.py
-```
+## Setup
 
-Run [supabase.sql](supabase.sql) in the Supabase SQL Editor. If your catalogue is empty, import [suburbs.csv](suburbs.csv) into `public.suburbs` using the Table Editor. Set a password for the `livability_app` database role. Then copy [.streamlit/secrets.example.toml](.streamlit/secrets.example.toml) to `.streamlit/secrets.toml`. Set `SUPABASE_DB_URL` to the Session pooler URI for the restricted `livability_app` login and set `GOOGLE_PLACES_API_KEY` for Places API (New). Add `GROQ_API_KEY` for AI suggestions, or use the keyword assistant without a key. Enter general preferences only. The AI option sends the submitted text to Groq. Keep secrets out of Git.
+The published `main` branch runs the rectangular Google Places Text Search dashboard and includes a standalone ABS polygon pilot. The current workspace build adds the default polygon comparison, its cache and the live benchmark described above.
 
-## 100 mark and measured results
-
-**South Brisbane, QLD sets 100 at 19.46 places per km²**. Google Places returned 39 unique IDs in its search rectangle and the ABS suburb area is 2.0041 km². The benchmark takes the highest density from 12 selected non-CBD suburbs across Sydney, Melbourne and Brisbane. Ten additional suburbs were measured and South Brisbane remained highest. Bondi Beach led the additional sample at 14.76/km².
-
-| Suburb | Places | ABS area (km²) | Places per km² | Personal score at equal weights |
-|---|---:|---:|---:|---:|
-| Bondi, NSW | 12 | 0.8647 | 13.88 | 51/100 |
-| Newtown, NSW | 6 | 1.5869 | 3.78 | 17/100 |
-
-Equal weights compare total count with the sample maximum of 39 and density with 19.46/km². The pipeline uses IDs-only Google Text Search and counts unique IDs within rectangular bounds. Supabase reuses fresh results for one calendar month. Rectangles can include places beyond the actual suburb boundary. The separate three-suburb polygon pilot requires Google Places Aggregate API access.
-
-Run `python measure.py` to refresh the reference sample or `python measure.py SAL10463` to check whether another eligible suburb beats the current mark. The latter flags a higher density for review.
-
-Data credits are the [Australian Bureau of Statistics ASGS Suburbs and Localities](https://www.abs.gov.au/statistics/standards/australian-statistical-geography-standard-asgs-edition-3/jul2021-jun2026/non-abs-structures/suburbs-and-localities) for the catalogue, bounds and areas, and [Google Maps Places API](https://developers.google.com/maps/documentation/places/web-service/text-search) for the search results.
-
-## Checks and boundary pilot
-
-Run `python check.py ALL` to run the offline Livability v2 checks. Stage E checks the polygon request format. Run `python google_boundary_pilot.py` for the three-suburb live test after enabling Places Aggregate API on the Google project.
+1. Install the Python dependencies with `python -m pip install -r requirements.txt`.
+2. Import [suburbs.csv](suburbs.csv) into `public.suburbs` in Supabase, or use an existing compatible suburb catalogue. Run [supabase.sql](supabase.sql) in the Supabase SQL Editor. If your checkout includes `boundary_cache.sql`, run it next to create the polygon cache, score views and expiry job.
+3. Set a password for the `livability_app` database role. Copy [.streamlit/secrets.example.toml](.streamlit/secrets.example.toml) to `.streamlit/secrets.toml` and set `SUPABASE_DB_URL` to the Session pooler URI on port `5432`. Use `livability_app.<project-ref>` as the username and URL-encode the role password. Keep the secrets file out of Git. [Supabase connection guide](https://supabase.com/docs/guides/database/connecting-to-postgres)
+4. For the polygon build, enable Places Aggregate API and set `GOOGLE_PLACES_AGGREGATE_API_KEY`. For rectangular search, enable Places API (New) and set `GOOGLE_PLACES_API_KEY`. Add `GROQ_API_KEY` to enable AI suggestions. On the published `main` branch, run `python measure.py` to populate the reference sample used by the rectangular dashboard.
+5. Run `python -m streamlit run app.py`, open `http://localhost:8501` and compare two suburbs. For a local preview with sample data, set `LIVABILITY_DEMO = true` in the secrets file.
