@@ -2,7 +2,7 @@
 
 import requests
 
-from google_dashboard.pipeline import PARKS_KPI, SEARCH_VERSION, connect
+from pipeline import PARKS_KPI, SEARCH_VERSION, connect
 
 CBD_NAMES = {
     "NSW": {"sydney", "sydney city", "parramatta", "newcastle", "wollongong"},

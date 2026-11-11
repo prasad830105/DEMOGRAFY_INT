@@ -3,6 +3,27 @@ begin;
 create schema if not exists livability;
 revoke all on schema livability from public;
 
+-- Create and secure the catalogue only when it does not already exist.
+do $$
+begin
+    if to_regclass('public.suburbs') is null then
+        create table public.suburbs (
+            sal_code text primary key,
+            suburb_name text not null,
+            state text not null,
+            postcode text,
+            area_km2 double precision,
+            population bigint,
+            min_lat double precision,
+            min_lon double precision,
+            max_lat double precision,
+            max_lon double precision
+        );
+        alter table public.suburbs enable row level security;
+    end if;
+end
+$$;
+
 -- Support the original CSV headers and the existing Demografy catalogue.
 do $$
 begin
