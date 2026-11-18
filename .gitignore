@@ -6,8 +6,15 @@ __pycache__/
 .env.*
 !.env.example
 .streamlit/secrets.toml
+.streamlit/*.log
+.streamlit/*.err
 .pytest_cache/
 streamlit.log
 streamlit-error.log
-.streamlit/*.log
-.streamlit/*.err
+.boundary-tools/
+SAL_2021_AUST_GDA2020_SHP.zip
+.chart-data-*/
+.codex-livability-ppt/
+.github-stage-f/
+.mentor-stage-f/
+output/

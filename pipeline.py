@@ -1,5 +1,6 @@
 """On-demand Google Places ingestion and PostgreSQL cache."""
 
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from time import monotonic
 
@@ -9,8 +10,13 @@ from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
 PARKS_KPI = "Parks and outdoor places"
-SEARCH_VERSION = 2
+SEARCH_VERSION = 3
+SEARCH_TIMEOUT_SECONDS = 45
 GOOGLE_URL = "https://places.googleapis.com/v1/places:searchText"
+PARKS_SEARCH_TYPES = ("park", "dog_park", "playground")
+PAGE_SIZE = 20
+MAX_PAGES = 3
+MAX_SPLITS = 2
 
 
 class PipelineError(Exception):
@@ -66,46 +72,80 @@ def load_catalog(database_url):
     return [Suburb(**row) for row in rows]
 
 
-def search_category(suburb, query, api_key, deadline):
+def search_rectangle(session, rectangle, place_type, api_key, deadline):
     body = {
-        "textQuery": query,
+        "textQuery": place_type.replace("_", " "),
+        "includedType": place_type,
+        "strictTypeFiltering": True,
         "regionCode": "AU",
         "languageCode": "en-AU",
-        "pageSize": 20,
-        "locationRestriction": {"rectangle": suburb.rectangle},
+        "pageSize": PAGE_SIZE,
+        "locationRestriction": {"rectangle": rectangle},
     }
     headers = {
         "X-Goog-Api-Key": api_key,
         "X-Goog-FieldMask": "places.id,nextPageToken",
     }
+    ids = []
+    for _ in range(MAX_PAGES):
+        remaining = deadline - monotonic()
+        if remaining <= 0:
+            raise PipelineError("The Places search timed out. Try comparing again.")
+        try:
+            response = session.post(
+                GOOGLE_URL, json=body, headers=headers,
+                timeout=(min(2, remaining / 2), min(5, remaining / 2)),
+            )
+            response.raise_for_status()
+            page = response.json()
+            ids.extend(place["id"] for place in page.get("places", []))
+        except requests.HTTPError as error:
+            code = error.response.status_code
+            if code in (401, 403):
+                raise PipelineError("Google denied the Places request. Check the API key and Places API (New) access.") from None
+            if code == 429:
+                raise PipelineError("Google Places reached its request or quota limit. Try again later.") from None
+            raise PipelineError(f"Google Places returned HTTP {code}.") from None
+        except (requests.RequestException, ValueError, KeyError, TypeError, AttributeError):
+            raise PipelineError("Google Places could not return a complete response. Try again.") from None
+        token = page.get("nextPageToken")
+        if not token:
+            break
+        body["pageToken"] = token
+    return set(ids), len(ids) >= PAGE_SIZE * MAX_PAGES or bool(token)
+
+
+def quarters(rectangle):
+    low, high = rectangle["low"], rectangle["high"]
+    latitudes = (low["latitude"], (low["latitude"] + high["latitude"]) / 2, high["latitude"])
+    longitudes = (low["longitude"], (low["longitude"] + high["longitude"]) / 2, high["longitude"])
+    return [
+        {
+            "low": {"latitude": latitudes[row], "longitude": longitudes[column]},
+            "high": {"latitude": latitudes[row + 1], "longitude": longitudes[column + 1]},
+        }
+        for row in range(2) for column in range(2)
+    ]
+
+
+def search_suburb(suburb, api_key, deadline):
+    def search(task):
+        place_type, rectangle = task
+        with requests.Session() as session:
+            return search_rectangle(session, rectangle, place_type, api_key, deadline)
+
     ids = set()
-    with requests.Session() as session:
-        for _ in range(3):
-            remaining = deadline - monotonic()
-            if remaining <= 0:
-                raise PipelineError("The Places search timed out. Try comparing again.")
-            try:
-                response = session.post(
-                    GOOGLE_URL, json=body, headers=headers,
-                    timeout=(min(2, remaining / 2), min(5, remaining / 2)),
-                )
-                response.raise_for_status()
-                page = response.json()
-                ids.update(place["id"] for place in page.get("places", []))
-            except requests.HTTPError as error:
-                code = error.response.status_code
-                if code in (401, 403):
-                    raise PipelineError("Google denied the Places request. Check the API key and Places API (New) access.") from None
-                if code == 429:
-                    raise PipelineError("Google Places reached its request or quota limit. Try again later.") from None
-                raise PipelineError(f"Google Places returned HTTP {code}.") from None
-            except (requests.RequestException, ValueError, KeyError):
-                raise PipelineError("Google Places could not return a complete response. Try again.") from None
-            token = page.get("nextPageToken")
-            if not token:
-                break
-            body["pageToken"] = token
-    return sorted(ids)
+    pending = [(place_type, suburb.rectangle) for place_type in PARKS_SEARCH_TYPES]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        for depth in range(MAX_SPLITS + 1):
+            saturated = []
+            for task, (matches, at_limit) in zip(pending, pool.map(search, pending), strict=True):
+                ids.update(matches)
+                if at_limit:
+                    saturated.append(task)
+            if not saturated or depth == MAX_SPLITS:
+                return sorted(ids), bool(saturated)
+            pending = [(place_type, quarter) for place_type, rectangle in saturated for quarter in quarters(rectangle)]
 
 
 def get_metrics(database_url, api_key, suburb, deadline):
@@ -113,7 +153,7 @@ def get_metrics(database_url, api_key, suburb, deadline):
     key = (suburb.sal_code, SEARCH_VERSION)
     bounds = Jsonb(suburb.rectangle)
     select_metrics = """
-        select refreshed_at, counts
+        select refreshed_at, counts, search_capped
         from livability.amenity_metrics
         where sal_code = %s and search_version = %s and bounds = %s
           and refreshed_at + interval '1 month' > statement_timestamp()
@@ -132,24 +172,21 @@ def get_metrics(database_url, api_key, suburb, deadline):
             if metrics:
                 return {**metrics, "source": "Supabase cache"}
 
-            snapshot = {
-                PARKS_KPI: search_category(
-                    suburb, "public parks, gardens and outdoor recreation areas", api_key, deadline
-                )
-            }
+            ids, search_capped = search_suburb(suburb, api_key, deadline)
+            snapshot = {PARKS_KPI: ids}
 
             connection.execute("""
-                insert into livability.place_snapshots (sal_code, search_version, bounds, place_ids)
-                values (%s, %s, %s, %s)
+                insert into livability.place_snapshots (sal_code, search_version, bounds, place_ids, search_capped)
+                values (%s, %s, %s, %s, %s)
                 on conflict (sal_code, search_version) do update
-                    set bounds = excluded.bounds, place_ids = excluded.place_ids,
+                    set bounds = excluded.bounds, place_ids = excluded.place_ids, search_capped = excluded.search_capped,
                         refreshed_at = statement_timestamp()
-            """, (*key, bounds, Jsonb(snapshot)))
+            """, (*key, bounds, Jsonb(snapshot), search_capped))
             metrics = connection.execute(select_metrics, (*key, bounds)).fetchone()
             return {**metrics, "source": "Google Maps"}
     except psycopg.errors.LockNotAvailable:
         raise PipelineError("This suburb is already being refreshed. Try comparing again shortly.") from None
-    except psycopg.errors.UndefinedTable:
-        raise PipelineError("The Supabase migration is missing. Apply supabase.sql and try again.") from None
+    except (psycopg.errors.UndefinedTable, psycopg.errors.UndefinedColumn):
+        raise PipelineError("The Supabase schema needs updating. Apply supabase.sql and try again.") from None
     except psycopg.Error:
         raise PipelineError("Supabase could not complete the comparison. Check the connection and database permissions.") from None

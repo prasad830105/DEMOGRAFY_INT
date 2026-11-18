@@ -10,14 +10,16 @@ import pandas as pd
 import psycopg
 import streamlit as st
 
+from boundary_store import ensure_boundary_measurement
+from google_boundary_pilot import BoundaryError
 from outdoor_analysis import (
-    benchmark_candidates, discover_places, load_benchmark, rating,
+    benchmark_candidates, benchmark_score, load_benchmark, outdoor_score_components, rating,
+    suggest_weight, weighted_outdoor_score,
 )
-from pipeline import PARKS_KPI, PipelineError, Suburb, get_metrics, load_catalog
-
-from livability.weighting import PARKS_MEASURES, personal_score, suggest_weights
+from pipeline import PARKS_KPI, SEARCH_TIMEOUT_SECONDS, PipelineError, Suburb, connect, get_metrics, load_catalog
 
 PALETTE = ["#7045CB", "#3E2C64"]
+KPI_HEADING = "Parks and Outdoor Spaces"
 DEMO_SUBURBS = [
     Suburb("demo-bondi", "Bondi", "NSW", "2026", 1.1, None, -33.90, 151.25, -33.88, 151.28),
     Suburb("demo-newtown", "Newtown", "NSW", "2042", 1.6, None, -33.91, 151.17, -33.89, 151.19),
@@ -49,7 +51,7 @@ def compare(suburbs, database_url, api_key, demo):
         ]
 
     progress = st.progress(0, text="Processing… checking for parks and outdoor places")
-    deadline = monotonic() + 12
+    deadline = monotonic() + SEARCH_TIMEOUT_SECONDS
     try:
         with ThreadPoolExecutor(max_workers=2) as pool:
             pending = {
@@ -72,18 +74,38 @@ def compare(suburbs, database_url, api_key, demo):
         progress.empty()
 
 
+def render_score_cards(names, values, grades, value_format, section):
+    leader = None
+    if len(values) == 2 and None not in values and values[0] != values[1]:
+        leader = int(values[1] > values[0])
+
+    for index, (column, name, value, grade) in enumerate(zip(st.columns(len(names)), names, values, grades, strict=True)):
+        highlight = index == leader
+        with column.container(border=True, key=f"{section}_leader" if highlight else None):
+            detail = " · ".join(filter(None, ("Higher score" if highlight else None, grade)))
+            st.metric(name, value_format.format(value) if value is not None else "Unavailable",
+                      delta=detail or None, delta_color="off", delta_arrow="off")
+    return leader
+
+
 def render_comparison(suburbs, results, labels, demo, database_url, groq_key, cohort):
-    names = [labels.get(suburb, suburb.label) for suburb in suburbs]
+    names = [labels.get(suburb.sal_code, suburb.label) for suburb in suburbs]
     counts = [result["counts"][PARKS_KPI] for result in results]
     densities = [count / suburb.area_km2 for count, suburb in zip(counts, suburbs, strict=True)]
     benchmark, benchmark_suburb, sample_size, count_reference = None, None, 0, None
-    if not demo:
+    if demo:
+        demo_densities = [count / suburb.area_km2 for count, suburb in zip(DEMO_COUNTS, DEMO_SUBURBS, strict=True)]
+        benchmark = max(demo_densities)
+        benchmark_suburb = DEMO_SUBURBS[demo_densities.index(benchmark)].label
+        sample_size = len(DEMO_SUBURBS)
+        count_reference = max(DEMO_COUNTS)
+    else:
         try:
             benchmark, benchmark_suburb, sample_size, count_reference = load_benchmark(database_url, cohort)
         except psycopg.Error:
             st.warning("The outdoor benchmark is temporarily unavailable.")
 
-    st.header(PARKS_KPI)
+    st.header(KPI_HEADING)
     with st.container(horizontal=True):
         for name, count, result in zip(names, counts, results, strict=True):
             refreshed = result["refreshed_at"]
@@ -103,16 +125,33 @@ def render_comparison(suburbs, results, labels, demo, database_url, groq_key, co
             ),
             tooltip=["Suburb:N", "Places found:Q"],
         ).properties(height=120)
-        st.altair_chart(chart, alt="Parks and outdoor places found in each suburb")
+        st.altair_chart(chart, alt="Parks and outdoor spaces found in each suburb")
         if not demo:
-            st.caption("**Google Maps** · Up to 60 results per suburb. Rectangular search bounds can include places in nearby suburbs.")
+            st.caption("**Google Maps** · Busy search areas are split at 60 results. The suburb rectangle can include nearby places.")
+
+    capped = [name for name, result in zip(names, results, strict=True) if result.get("search_capped")]
+    if capped:
+        st.warning(f"The count for {', '.join(capped)} may be incomplete. A smallest search area reached Google's result limit.")
+
+    if benchmark:
+        st.subheader(f"{KPI_HEADING} score out of 100")
+        scores = [round(benchmark_score(density, benchmark), 1) for density in densities]
+        render_score_cards(names, scores, [rating(score) for score in scores], "{:.1f}/100", "benchmark")
 
     st.subheader("Outdoor places per km²")
-    with st.container(horizontal=True):
-        for name, density in zip(names, densities, strict=True):
-            grade = rating(100 * density / benchmark) if benchmark else None
-            st.metric(name, f"{density:.2f}", delta=grade, delta_color="off", border=True)
-    if benchmark:
+    displayed_densities = [round(density, 2) for density in densities]
+    leader = render_score_cards(names, displayed_densities, [None] * len(names), "{:.2f}", "density")
+    if leader is None:
+        st.markdown(f"Both suburbs are tied at **{displayed_densities[0]:.2f} outdoor places per km²**.")
+    else:
+        other = 1 - leader
+        st.markdown(
+            f"**{names[leader]}** is the better choice for parks density, with **{displayed_densities[leader]:.2f}** "
+            f"outdoor places per km² compared with **{displayed_densities[other]:.2f}** in {names[other]}."
+        )
+    if demo:
+        st.caption(f"Demo benchmark · {benchmark_suburb} · {benchmark:.2f} places per km².")
+    elif benchmark:
         st.caption(f"100-point benchmark · {benchmark_suburb} · {benchmark:.2f} places per km². Highest of {sample_size} sampled suburbs outside CBDs.")
     elif not demo:
         st.caption(f"Benchmark sample · {sample_size} of 12 suburbs have fresh results. The highest density sets 100.")
@@ -133,45 +172,135 @@ def render_comparison(suburbs, results, labels, demo, database_url, groq_key, co
         st.caption(f"Violet · {names[0]}   |   Deep plum · {names[1]} · Markers show the midpoints of the CSV bounds.")
 
 
-def render_preferences(names, counts, densities, benchmark, count_reference, groq_key):
-    with st.expander("Personalise your parks comparison", expanded=True):
-        preferences = st.text_input(
-            "What matters to you outdoors?",
-            placeholder="I have a toddler and no car.",
-            max_chars=500,
-            help="With Groq configured, submitting sends this text to Groq. Avoid personal details.",
+def refresh_boundary_comparison(suburbs, database_url, aggregate_key):
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        pending = {
+            pool.submit(ensure_boundary_measurement, database_url, aggregate_key, suburb): suburb
+            for suburb in suburbs
+        }
+        errors = {}
+        for completed in as_completed(pending):
+            suburb = pending[completed]
+            try:
+                error = completed.result()
+            except BoundaryError as failure:
+                error = str(failure)
+            if error:
+                errors[suburb] = error
+    return errors
+
+
+def render_boundary_comparison(suburbs, labels, database_url, groq_key, errors):
+    try:
+        with connect(database_url) as connection:
+            rows = connection.execute("""
+                select benchmark.benchmark_name, benchmark.measured_suburbs, benchmark.catalogue_suburbs,
+                       scores.sal_code, scores.density_score, scores.total_score
+                from livability.current_boundary_benchmark as benchmark
+                left join livability.current_boundary_scores as scores on scores.sal_code = any(%s)
+            """, ([suburb.sal_code for suburb in suburbs],)).fetchall()
+    except psycopg.Error:
+        st.warning("The ABS boundary scores are temporarily unavailable.")
+        return
+
+    st.header(KPI_HEADING)
+    names = [labels.get(suburb.sal_code, suburb.label) for suburb in suburbs]
+    for suburb, name in zip(suburbs, names, strict=True):
+        if suburb in errors:
+            st.warning(f"{name} — {errors[suburb]}")
+    if not rows:
+        st.info("The benchmark needs a fresh measurement with a positive parks density outside CBDs.")
+        return
+
+    scores = {row["sal_code"]: row for row in rows if row["sal_code"] is not None}
+    densities = [scores.get(suburb.sal_code, {}).get("density_score") for suburb in suburbs]
+    grades = [rating(score) if score is not None else None for score in densities]
+    leader = render_score_cards(names, densities, grades, "{}/100", "density")
+    if None in densities:
+        st.caption("Both suburbs need a score for a recommendation.")
+    elif leader is None:
+        st.markdown(f"Both suburbs are in the same parks density score band at **{densities[0]}/100**.")
+    else:
+        other = 1 - leader
+        st.markdown(
+            f"**{names[leader]}** is the better choice for parks density. Its higher concentration of outdoor places "
+            f"per km² earned **{densities[leader]}/100**, compared with **{densities[other]}/100** for {names[other]}."
         )
-        if st.button("Suggest KPI weights"):
-            with st.spinner("Suggesting weights…"):
-                suggestion = suggest_weights(preferences, groq_key, kpis=PARKS_MEASURES)
-            for key, value in suggestion.weights.items():
-                st.session_state[f"outdoor_weight_{key}"] = value
-            st.session_state.outdoor_suggestion = suggestion
-        suggestion = st.session_state.get("outdoor_suggestion")
-        if suggestion:
-            st.caption({"ai": "Groq suggestion", "keywords": "Keyword suggestion",
-                        "default": "Default weights"}[suggestion.source])
-        weights = {}
-        for key, label in (("parks_total", "Total places"), ("parks", "Places per km²")):
-            widget_key = f"outdoor_weight_{key}"
-            st.session_state.setdefault(widget_key, 3)
-            weights[key] = st.slider(label, 0, 5, key=widget_key)
-            if suggestion and suggestion.reasons.get(key):
-                st.caption(suggestion.reasons[key])
-        if not (benchmark and count_reference):
-            st.caption("Personal scores are available when the benchmark sample is complete.")
-        elif not any(weights.values()):
-            st.caption("Set at least one weight above zero to see personal scores.")
+
+    benchmark = rows[0]
+    st.caption(
+        f"100-point benchmark · {benchmark['benchmark_name']} · Highest measured density outside CBDs. "
+        f"Coverage {benchmark['measured_suburbs']:,}/{benchmark['catalogue_suburbs']:,} suburbs."
+    )
+    st.caption("Google Maps · Parks, national parks, playgrounds and gardens matched to ABS suburb polygons.")
+    measured = [suburb for suburb in suburbs if suburb.sal_code in scores]
+    if measured:
+        render_preferences(
+            [labels.get(suburb.sal_code, suburb.label) for suburb in measured],
+            [scores[suburb.sal_code]["total_score"] for suburb in measured],
+            [scores[suburb.sal_code]["density_score"] for suburb in measured],
+            100, 100, groq_key, score_bands=True,
+        )
+
+
+def render_preferences(names, counts, densities, benchmark, count_reference, groq_key, *, score_bands=False):
+    with st.expander("Personalise your parks comparison", expanded=True):
+        if groq_key:
+            preferences = st.text_input(
+                "What matters to you outdoors?",
+                placeholder="I prefer a suburb with more parks packed into a smaller area.",
+                max_chars=500,
+            )
+            if st.button("Suggest KPI weights"):
+                if not preferences.strip():
+                    st.warning("Describe what matters to you first.")
+                else:
+                    try:
+                        with st.spinner("Suggesting weights…"):
+                            weight, explanation = suggest_weight(groq_key, preferences.strip())
+                        st.session_state.outdoor_total_weight = weight
+                        st.session_state.outdoor_weight_explanation = explanation
+                    except ValueError as error:
+                        st.error(str(error))
+        st.session_state.setdefault("outdoor_total_weight", 50)
+        total_weight = st.slider("Total places weight (%)", 0, 100, step=5, key="outdoor_total_weight")
+        st.caption(f"Places per km² weight · {100 - total_weight}%")
+        if st.session_state.get("outdoor_weight_explanation"):
+            st.caption(f"AI suggestion · {st.session_state.outdoor_weight_explanation}")
+        if benchmark and count_reference:
+            st.subheader(f"Personalised {KPI_HEADING} score")
+            scores = [
+                weighted_outdoor_score(count, density, count_reference, benchmark, total_weight)
+                for count, density in zip(counts, densities, strict=True)
+            ]
+            displayed_scores = [round(score, 1) for score in scores]
+            leader = render_score_cards(names, displayed_scores, [rating(score) for score in displayed_scores],
+                                        "{:.1f}/100", "personal")
+            if leader is not None:
+                other = 1 - leader
+                winner_total, winner_density = outdoor_score_components(
+                    counts[leader], densities[leader], count_reference, benchmark,
+                )
+                other_total, other_density = outdoor_score_components(
+                    counts[other], densities[other], count_reference, benchmark,
+                )
+                total_advantage = (winner_total - other_total) * total_weight
+                density_advantage = (winner_density - other_density) * (100 - total_weight)
+                drivers = [label for label, advantage in (
+                    ("total outdoor places", total_advantage), ("outdoor places per km²", density_advantage),
+                ) if advantage > 0]
+                st.markdown(
+                    f"**{names[leader]}** is the better match for your weights, scoring **{displayed_scores[leader]:.1f}/100** "
+                    f"to **{displayed_scores[other]:.1f}/100**. It has a higher score for {' and '.join(drivers)}."
+                )
+            elif len(displayed_scores) == 2:
+                st.markdown(f"With your weights, both suburbs score **{displayed_scores[0]:.1f}/100**.")
+            if score_bands:
+                st.caption("The weights combine the total-places and density scores, each rounded down in five-point steps.")
+            else:
+                st.caption(f"100-point references · {count_reference} total places and {benchmark:.2f} places per km².")
         else:
-            st.subheader("Personal parks score")
-            with st.container(horizontal=True):
-                for name, count, density in zip(names, counts, densities, strict=True):
-                    score = personal_score({
-                        "parks_total": min(100, 100 * count / count_reference),
-                        "parks": min(100, 100 * density / benchmark),
-                    }, weights)
-                    st.metric(name, f"{score}/100", delta=rating(score), delta_color="off", border=True)
-            st.caption(f"100-point references · {count_reference} total places and {benchmark:.2f} places per km².")
+            st.caption("Personalised scores are available when the benchmark sample is complete.")
 
 
 st.set_page_config(page_title="Neighbourhood Livability Index", page_icon=":material/location_on:", layout="centered")
@@ -189,6 +318,12 @@ st.html("""
         .st-key-livability_hero p {
             color: #e8dcfa;
         }
+        .st-key-density_leader, .st-key-benchmark_leader, .st-key-personal_leader {
+            background-color: #F6F1FC;
+            outline: 1px solid #7045CB;
+            outline-offset: -1px;
+            border-radius: 0.5rem;
+        }
     </style>
 """)
 with st.container(key="livability_hero"):
@@ -197,20 +332,15 @@ with st.container(key="livability_hero"):
 
 database_url = setting("SUPABASE_DB_URL")
 api_key = setting("GOOGLE_PLACES_API_KEY")
+aggregate_key = setting("GOOGLE_PLACES_AGGREGATE_API_KEY") or api_key
 groq_key = setting("GROQ_API_KEY")
 demo = setting("LIVABILITY_DEMO").lower() in {"1", "true"}
 if demo:
     st.info("Demo mode uses sample counts for parks and outdoor places.")
     catalog = DEMO_SUBURBS
 else:
-    if not (database_url and api_key):
-        missing = [
-            name for name, value in (
-                ("SUPABASE_DB_URL", database_url),
-                ("GOOGLE_PLACES_API_KEY", api_key),
-            ) if not value
-        ]
-        st.info(f"Live data setup requires {', '.join(missing)} in Streamlit secrets. See README.md for setup.")
+    if not database_url:
+        st.info("Live data setup requires SUPABASE_DB_URL in Streamlit secrets. See README.md for setup.")
         st.stop()
     try:
         with st.spinner("Loading suburbs…"):
@@ -225,19 +355,26 @@ if len(catalog) < 2:
 
 duplicates = Counter(suburb.label for suburb in catalog)
 labels = {
-    suburb: f"{suburb.label} · {suburb.sal_code}" if duplicates[suburb.label] > 1 else suburb.label
+    suburb.sal_code: f"{suburb.label} · {suburb.sal_code}" if duplicates[suburb.label] > 1 else suburb.label
     for suburb in catalog
 }
+use_aggregate = not demo and st.toggle(
+    "Enable Places Aggregate API",
+    value=False,
+    key="use_places_aggregate",
+    help="Turn on to compare using exact ABS suburb boundaries. Turn off to use Places API (New) Text Search.",
+)
 with st.form("suburb_comparison"):
     first_col, second_col = st.columns(2)
     with first_col:
-        first = st.selectbox("First suburb", catalog, format_func=labels.__getitem__, index=0 if demo else None, placeholder="Search suburb name or postcode")
+        first = st.selectbox("First suburb", catalog, format_func=lambda suburb: labels[suburb.sal_code], index=0 if demo else None, placeholder="Search suburb name or postcode")
     with second_col:
-        second = st.selectbox("Second suburb", catalog, format_func=labels.__getitem__, index=1 if demo else None, placeholder="Search suburb name or postcode")
+        second = st.selectbox("Second suburb", catalog, format_func=lambda suburb: labels[suburb.sal_code], index=1 if demo else None, placeholder="Search suburb name or postcode")
     submitted = st.form_submit_button("Compare suburbs", type="primary", icon=":material/compare_arrows:")
 
 if submitted:
     st.session_state.pop("parks_comparison", None)
+    st.session_state.pop("boundary_comparison_result", None)
     if first is None or second is None:
         st.warning("Choose two suburbs from the catalogue.")
     elif first == second:
@@ -245,25 +382,21 @@ if submitted:
     else:
         selected = (first, second)
         try:
-            st.session_state.parks_comparison = (selected, compare(selected, database_url, api_key, demo))
+            if use_aggregate:
+                with st.spinner("Checking Supabase and fetching any missing measurements…"):
+                    errors = refresh_boundary_comparison(selected, database_url, aggregate_key)
+                st.session_state.boundary_comparison_result = (selected, errors)
+            else:
+                if not demo and not api_key:
+                    raise PipelineError("Set GOOGLE_PLACES_API_KEY to use the rectangular search.")
+                st.session_state.parks_comparison = (selected, compare(selected, database_url, api_key, demo))
         except PipelineError as error:
             st.error(str(error))
 
-if "parks_comparison" in st.session_state:
+if use_aggregate and "boundary_comparison_result" in st.session_state:
+    selected, errors = st.session_state.boundary_comparison_result
+    render_boundary_comparison(selected, labels, database_url, groq_key, errors)
+
+if not use_aggregate and "parks_comparison" in st.session_state:
     selected, results = st.session_state.parks_comparison
     render_comparison(selected, results, labels, demo, database_url, groq_key, benchmark_candidates(catalog))
-
-if groq_key:
-    with st.expander("Discover outdoor places across Australia"):
-        interest = st.text_input("Outdoor interests or region (optional)", max_chars=300)
-        if st.button("Search for popular places"):
-            st.session_state.pop("outdoor_discovery", None)
-            try:
-                with st.spinner("Searching Australian parks and tourism sources…"):
-                    st.session_state.outdoor_discovery = discover_places(
-                        groq_key, interest.strip() or "Popular parks and outdoor attractions across Australia"
-                    )
-            except ValueError as error:
-                st.error(str(error))
-        if st.session_state.get("outdoor_discovery"):
-            st.markdown(st.session_state.outdoor_discovery)

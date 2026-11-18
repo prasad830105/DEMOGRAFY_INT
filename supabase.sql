@@ -59,9 +59,12 @@ create table if not exists livability.place_snapshots (
     primary key (sal_code, search_version)
 );
 
+alter table livability.place_snapshots
+    add column if not exists search_capped boolean not null default false;
+
 create or replace view livability.amenity_metrics as
 select snapshot.sal_code, snapshot.search_version, snapshot.bounds, snapshot.refreshed_at,
-       transformed.counts
+       transformed.counts, snapshot.search_capped
 from livability.place_snapshots as snapshot
 cross join lateral (
     select jsonb_object_agg(category, jsonb_array_length(ids)) as counts
